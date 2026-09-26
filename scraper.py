@@ -51,6 +51,7 @@ WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "25"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "true").strip().casefold() in {"1", "true", "yes", "on"}
 ARTIFACTS = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
 PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
+BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN", "").strip()
 
 NO_SLOT_PATTERNS = (
     "no hay citas disponibles",
@@ -138,6 +139,41 @@ def parse_proxy_settings():
     if parsed.password:
         proxy_dict["password"] = parsed.password
     return proxy_dict
+
+
+def create_browser(p, headless: bool, proxy_config: dict | None) -> Browser:
+    if BROWSERLESS_TOKEN:
+        ws_url = (
+            f"wss://production-ams.browserless.io/chromium/stealth"
+            f"?token={BROWSERLESS_TOKEN}&proxy=residential&proxyCountry=es"
+        )
+        LOG.info("Connecting to Browserless (Amsterdam) with Spanish residential proxy...")
+        return p.chromium.connect_over_cdp(ws_url)
+
+    launch_kwargs = {
+        "headless": headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    }
+    if proxy_config:
+        launch_kwargs["proxy"] = proxy_config
+        LOG.info("Using proxy server: %s", proxy_config.get("server"))
+
+    return p.chromium.launch(**launch_kwargs)
+
+
+def create_context(browser: Browser) -> BrowserContext:
+    return browser.new_context(
+        ignore_https_errors=True,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        locale="es-ES",
+        timezone_id="Europe/Madrid",
+        viewport={"width": 1920, "height": 1080},
+    )
 
 
 def save_diagnostics(page: Page, label: str) -> None:
@@ -327,27 +363,9 @@ def check_appointments() -> bool:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {
-            "headless": headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
-            LOG.info("Using proxy server: %s", proxy_config.get("server"))
-
-        browser: Browser = p.chromium.launch(**launch_kwargs)
+        browser: Browser = create_browser(p, headless, proxy_config)
         try:
-            context: BrowserContext = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                locale="es-ES",
-                timezone_id="Europe/Madrid",
-                viewport={"width": 1920, "height": 1080},
-            )
+            context: BrowserContext = create_context(browser)
             setup_page_routes(context)
             page: Page = context.new_page()
             page.set_default_timeout(90000)
@@ -448,25 +466,9 @@ def list_procedures() -> int:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {
-            "headless": headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
-
-        browser = p.chromium.launch(**launch_kwargs)
+        browser = create_browser(p, headless, proxy_config)
         try:
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                locale="es-ES",
-                timezone_id="Europe/Madrid",
-            )
+            context = create_context(browser)
             setup_page_routes(context)
             page = context.new_page()
             page.set_default_timeout(90000)
@@ -512,25 +514,9 @@ def verify_procedure_selection() -> int:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {
-            "headless": headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
-
-        browser = p.chromium.launch(**launch_kwargs)
+        browser = create_browser(p, headless, proxy_config)
         try:
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                locale="es-ES",
-                timezone_id="Europe/Madrid",
-            )
+            context = create_context(browser)
             setup_page_routes(context)
             page = context.new_page()
             page.set_default_timeout(90000)

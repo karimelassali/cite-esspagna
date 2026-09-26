@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   check-appointments:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -27,6 +27,7 @@ jobs:
       NATIONALITY: "MARRUECOS"
       ALWAYS_NOTIFY: "true"
       PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+      BROWSERLESS_TOKEN: ${{ secrets.BROWSERLESS_TOKEN }}
 
     steps:
       - name: Check out repository
@@ -41,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --requirement requirements.txt
-          playwright install chromium
+          playwright install --with-deps chromium
 
       - name: Runner Network Diagnostics
         run: |
