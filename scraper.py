@@ -165,18 +165,27 @@ def setup_page_routes(context: BrowserContext) -> None:
     context.route("**/*", block_unnecessary_resources)
 
 
-def navigate_page(page: Page, url: str, timeout: int = 60000, max_retries: int = 2) -> None:
-    """Navigate to URL using domcontentloaded and retry if connection stalls."""
+def navigate_page(page: Page, url: str, timeout: int = 90000, max_retries: int = 3) -> None:
+    """Navigate to URL with retry and commit fallback."""
     for attempt in range(1, max_retries + 1):
         try:
-            LOG.info("Navigating to: %s (attempt %d/%d)", url, attempt, max_retries)
-            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            LOG.info("Navigating to: %s (attempt %d/%d, timeout %ds)", url, attempt, max_retries, timeout // 1000)
+            page.goto(url, timeout=timeout, wait_until="commit")
             return
         except Exception as exc:
             if attempt == max_retries:
+                if "timeout" in str(exc).lower():
+                    raise RuntimeError(
+                        f"Page navigation timed out after {timeout // 1000}s. "
+                        "GitHub Actions cloud IPs (Microsoft Azure) are geoblocked / packet-dropped "
+                        "by the Spanish Government F5 firewall. "
+                        "To run in GitHub Actions, add a Spanish proxy to PROXY_SERVER secret, "
+                        "or run the script directly on your computer."
+                    ) from exc
                 raise
-            LOG.warning("Navigation attempt %d failed (%s); retrying in 3s...", attempt, exc)
-            page.wait_for_timeout(3000)
+            wait_sec = 4 * attempt
+            LOG.warning("Navigation attempt %d failed (%s); retrying in %ds...", attempt, exc, wait_sec)
+            page.wait_for_timeout(wait_sec * 1000)
 
 
 def is_waf_rejected(page: Page) -> bool:
@@ -318,7 +327,15 @@ def check_appointments() -> bool:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {"headless": headless}
+        launch_kwargs = {
+            "headless": headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
             LOG.info("Using proxy server: %s", proxy_config.get("server"))
@@ -333,6 +350,8 @@ def check_appointments() -> bool:
             )
             setup_page_routes(context)
             page: Page = context.new_page()
+            page.set_default_timeout(90000)
+            page.set_default_navigation_timeout(90000)
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
@@ -429,7 +448,15 @@ def list_procedures() -> int:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {"headless": headless}
+        launch_kwargs = {
+            "headless": headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
 
@@ -442,6 +469,8 @@ def list_procedures() -> int:
             )
             setup_page_routes(context)
             page = context.new_page()
+            page.set_default_timeout(90000)
+            page.set_default_navigation_timeout(90000)
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
@@ -483,7 +512,15 @@ def verify_procedure_selection() -> int:
     proxy_config = parse_proxy_settings()
 
     with stealth.use_sync(sync_playwright()) as p:
-        launch_kwargs = {"headless": headless}
+        launch_kwargs = {
+            "headless": headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
         if proxy_config:
             launch_kwargs["proxy"] = proxy_config
 
@@ -496,6 +533,8 @@ def verify_procedure_selection() -> int:
             )
             setup_page_routes(context)
             page = context.new_page()
+            page.set_default_timeout(90000)
+            page.set_default_navigation_timeout(90000)
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
@@ -591,10 +630,18 @@ def main() -> int:
         photo_proof = proof_file if proof_file.exists() else (waf_file if waf_file.exists() else None)
         if TELEGRAM_TOKEN and CHAT_ID:
             try:
-                if is_waf_rejected_err := "request rejected" in str(exc).lower():
+                err_str = str(exc).lower()
+                if "request rejected" in err_str:
                     send_telegram(
                         "⚠️ Cita Zarwal: السيت ديال ICPPlus بلوكا الطلب (WAF - Request Rejected).\n"
                         "هادشي كيعني بلي الـ IP تبلوكات مؤقتاً. عافاك شوف السيت بيدك ولا دير بروكسي سكني إسباني (Residential Proxy).",
+                        photo_path=photo_proof,
+                    )
+                elif "timeout" in err_str or "timed out" in err_str:
+                    send_telegram(
+                        "⚠️ Cita Zarwal: السيت ما جاوبش فـ GitHub Actions (Timeout).\n"
+                        "سيرفرات GitHub كايكونو على برا د إسبانيا والحكومة الإسبانية كاتبلوكي اتصال السيرفرات السحابية بالكامل.\n\n"
+                        "الحل: ضيف PROXY_SERVER إسباني فـ GitHub Secrets، أو خدم السكريبت من البيسي ديالك مباشرة.",
                         photo_path=photo_proof,
                     )
                 else:
