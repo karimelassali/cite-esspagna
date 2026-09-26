@@ -1,0 +1,580 @@
+"""Notification-only ICPPlus appointment checker using Playwright & Stealth.
+
+The checker deliberately stops before any appointment is selected or booked.
+It uses Playwright with playwright-stealth to bypass client-side bot detection,
+waits for the F5 BIG-IP WAF challenge (TSPD) to settle, and supports optional
+residential proxy routing for cloud/CI environments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlencode, urlparse
+
+import requests
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+from playwright_stealth import Stealth
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Windows PowerShell legacy code page fix
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOG = logging.getLogger("cita-tracker")
+
+BASE_URL = "https://icp.administracionelectronica.gob.es/icpplus"
+PROVINCE_CODE = os.getenv("PROVINCE_CODE", "48").strip()
+PROCEDURE_TEXT = os.getenv(
+    "PROCEDURE_TEXT",
+    "POLICÍA-TOMA DE HUELLAS (EXPEDICIÓN DE TARJETA) INICIAL, RENOVACIÓN, DUPLICADO Y LEY 14/2013",
+).strip()
+NIE = os.getenv("NIE", "").strip().upper()
+FULL_NAME = os.getenv("FULL_NAME", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "25"))
+ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "true").strip().casefold() in {"1", "true", "yes", "on"}
+ARTIFACTS = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
+PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
+
+NO_SLOT_PATTERNS = (
+    "no hay citas disponibles",
+    "en este momento no hay citas disponibles",
+    "no existen citas disponibles",
+)
+SLOT_PATTERNS = (
+    "seleccione una cita",
+    "seleccione la cita",
+    "citas disponibles",
+    "seleccione una fecha",
+    "seleccione el horario",
+)
+
+
+def normalized(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def validate_configuration(require_telegram: bool = True) -> None:
+    missing = []
+    for name, value in (
+        ("NIE", NIE),
+        ("FULL_NAME", FULL_NAME),
+        ("PROCEDURE_TEXT", PROCEDURE_TEXT),
+    ):
+        if not value:
+            missing.append(name)
+    if require_telegram:
+        for name, value in (("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("CHAT_ID", CHAT_ID)):
+            if not value:
+                missing.append(name)
+    if missing:
+        raise ValueError("Missing required environment variables: " + ", ".join(missing))
+    if not re.fullmatch(r"[XYZ]\d{7}[A-Z]", NIE):
+        raise ValueError("NIE must look like X/Y/Z followed by 7 digits and one letter")
+
+
+def send_telegram(message: str, photo_path: Path | str | None = None) -> None:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        raise ValueError("TELEGRAM_TOKEN and CHAT_ID must both be set before sending a Telegram message")
+
+    if photo_path and Path(photo_path).exists():
+        endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        try:
+            with open(photo_path, "rb") as photo_file:
+                response = requests.post(
+                    endpoint,
+                    data={"chat_id": CHAT_ID, "caption": message[:1024]},
+                    files={"photo": photo_file},
+                    timeout=30,
+                )
+            payload = response.json() if response.ok else {}
+            if response.ok and payload.get("ok"):
+                LOG.info("Telegram photo proof sent successfully")
+                return
+            LOG.warning("sendPhoto failed (%s); falling back to sendMessage", payload.get("description"))
+        except Exception as exc:
+            LOG.warning("Could not send Telegram photo: %s", exc)
+
+    # Standard sendMessage fallback
+    endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    response = requests.post(
+        endpoint,
+        json={"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": True},
+        timeout=20,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not response.ok or not payload.get("ok"):
+        description = payload.get("description", f"HTTP {response.status_code}")
+        raise RuntimeError(f"Telegram rejected the message: {description}")
+
+
+def parse_proxy_settings():
+    if not PROXY_SERVER:
+        return None
+    parsed = urlparse(PROXY_SERVER)
+    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}" if parsed.port else f"{parsed.scheme}://{parsed.hostname}"
+    proxy_dict = {"server": server}
+    if parsed.username:
+        proxy_dict["username"] = parsed.username
+    if parsed.password:
+        proxy_dict["password"] = parsed.password
+    return proxy_dict
+
+
+def save_diagnostics(page: Page, label: str) -> None:
+    try:
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^a-z0-9_-]+", "-", label.casefold()).strip("-")
+        page.screenshot(path=str(ARTIFACTS / f"{safe}.png"))
+        (ARTIFACTS / f"{safe}.html").write_text(page.content(), encoding="utf-8")
+        LOG.info("Saved diagnostics in %s", ARTIFACTS.resolve())
+    except Exception as exc:
+        LOG.warning("Failed saving diagnostics for %s: %s", label, exc)
+
+
+def is_waf_rejected(page: Page) -> bool:
+    try:
+        title = page.title().lower()
+        if "request rejected" in title:
+            return True
+        body = page.locator("body").inner_text(timeout=2000).lower()
+        if "the requested url was rejected" in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_not_rejected(page: Page) -> None:
+    """Check if the WAF rejected the request."""
+    if is_waf_rejected(page):
+        save_diagnostics(page, "waf-rejected")
+        raise RuntimeError(
+            "ICPPlus F5 WAF rejected this request (Request Rejected). "
+            "Please check if your IP is rate-limited or configure a Spanish residential proxy via PROXY_SERVER."
+        )
+
+
+def wait_for_challenge_settle(page: Page, timeout: int = WAIT_SECONDS) -> None:
+    """Wait for F5 BIG-IP TSPD cookie challenge to finish and the form to appear."""
+    start = time.time()
+    while time.time() - start < timeout:
+        ensure_not_rejected(page)
+        # Check if the actual application page has loaded
+        if page.locator("select#sede, select[name*='tramiteGrupo'], #prov_selecc").count() > 0:
+            return
+        if page.locator("#txtIdCitado, input[name*='IdCitado']").count() > 0:
+            return
+        page.wait_for_timeout(1000)
+    ensure_not_rejected(page)
+
+
+def select_procedure(page: Page) -> None:
+    target = normalized(PROCEDURE_TEXT)
+
+    # Search through all select dropdowns
+    for sel in page.locator("select").all():
+        for opt in sel.locator("option").all():
+            opt_text = normalized(opt.inner_text())
+            if target in opt_text:
+                val = opt.get_attribute("value")
+                sel_id = sel.get_attribute("id") or sel.get_attribute("name") or "select"
+                sel.select_option(value=val)
+                LOG.info("Selected procedure in %s: %s (value=%s)", sel_id, opt.inner_text().strip(), val)
+
+                # Reset other tramite Grupo dropdowns if needed
+                page.evaluate(
+                    """(currentId) => {
+                        document.querySelectorAll("select[id^='tramiteGrupo']").forEach(s => {
+                            if (s.id !== currentId) {
+                                s.value = "-1";
+                            }
+                        });
+                        if (window.cargaMensajesTramite) window.cargaMensajesTramite();
+                    }""",
+                    sel_id,
+                )
+                page.wait_for_timeout(1000)
+                return
+
+    # Radio button fallback
+    for label in page.locator("label").all():
+        if target in normalized(label.inner_text()):
+            ctrl_id = label.get_attribute("for")
+            if ctrl_id and page.locator(f"#{ctrl_id}").count() > 0:
+                page.locator(f"#{ctrl_id}").check()
+            else:
+                label.locator("input[type=radio]").check()
+            LOG.info("Selected procedure radio: %s", label.inner_text().strip())
+            page.wait_for_timeout(1000)
+            return
+
+    raise RuntimeError(f"No procedure contains {PROCEDURE_TEXT!r}")
+
+
+def fill_identity(page: Page) -> None:
+    ensure_not_rejected(page)
+
+    # Document type: NIE radio if present
+    nie_radio = page.locator("#rdbTipoDocNie, input[type='radio'][value='NIE']").first
+    if nie_radio.is_visible():
+        nie_radio.check()
+        page.wait_for_timeout(500)
+
+    # NIE input
+    id_field = page.locator("#txtIdCitado, input[name='txtIdCitado'], input[id*='IdCitado']").first
+    id_field.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
+    id_field.fill(NIE)
+    page.wait_for_timeout(300)
+
+    # Full name input
+    name_field = page.locator("#txtDesCitado, #txtNombre, input[name='txtDesCitado'], input[id*='Nombre']").first
+    name_field.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
+    name_field.fill(FULL_NAME)
+    page.wait_for_timeout(300)
+
+    # Nationality
+    nationality = os.getenv("NATIONALITY", "MARRUECOS").strip()
+    norm_nat = normalized(nationality)
+    matched_select = None
+    matched_value = None
+
+    for sel in page.locator("select").all():
+        if not sel.is_visible():
+            continue
+        for opt in sel.locator("option").all():
+            if normalized(opt.inner_text()) == norm_nat:
+                matched_select = sel
+                matched_value = opt.get_attribute("value")
+                break
+        if matched_select:
+            break
+
+    if not matched_select:
+        raise RuntimeError(f"Could not find nationality dropdown for {nationality!r}")
+
+    matched_select.select_option(value=matched_value)
+    LOG.info("Selected nationality: %s", nationality)
+    page.wait_for_timeout(500)
+
+
+def dismiss_cookie_banner(page: Page) -> None:
+    cookie_btn = page.locator("#cookie_action_close_header").first
+    if cookie_btn.is_visible():
+        cookie_btn.click()
+        page.wait_for_timeout(500)
+
+
+def check_appointments() -> bool:
+    stealth = Stealth(navigator_languages_override=("es-ES", "es"))
+    headless = os.getenv("HEADLESS", "true").lower() != "false"
+    proxy_config = parse_proxy_settings()
+
+    with stealth.use_sync(sync_playwright()) as p:
+        launch_kwargs = {"headless": headless}
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+            LOG.info("Using proxy server: %s", proxy_config.get("server"))
+
+        browser: Browser = p.chromium.launch(**launch_kwargs)
+        try:
+            context: BrowserContext = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="es-ES",
+                timezone_id="Europe/Madrid",
+                viewport={"width": 1920, "height": 1080},
+            )
+            page: Page = context.new_page()
+            stealth.apply_stealth_sync(page)
+
+            query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
+            url = f"{BASE_URL}/citar?{query}"
+            LOG.info("Navigating to: %s", url)
+            page.goto(url, timeout=45000, wait_until="load")
+
+            # 1. Wait for page/F5 challenge to settle
+            wait_for_challenge_settle(page)
+            dismiss_cookie_banner(page)
+
+            # 2. Select procedure
+            select_procedure(page)
+
+            # 3. Click Aceptar / Siguiente
+            submit_btn = page.locator("#btnAceptar, #btnSiguiente, input[type=button][value='Aceptar']").first
+            submit_btn.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
+            submit_btn.hover()
+            page.wait_for_timeout(500)
+            submit_btn.click()
+
+            # Wait for navigation / response
+            page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
+            page.wait_for_timeout(2000)
+            ensure_not_rejected(page)
+
+            # 4. Handle informational / entry intermediate page if present
+            # acInfo sometimes has an "Entrar" or "Acceder sin cl@ve" button
+            entry_btn = page.locator(
+                "#btnEntrar, input[value*='Entrar'], button:has-text('Entrar'), a:has-text('Entrar')"
+            ).first
+            if entry_btn.is_visible():
+                entry_btn.click()
+                page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
+                page.wait_for_timeout(1500)
+                ensure_not_rejected(page)
+
+            # 5. Fill identity data
+            fill_identity(page)
+
+            # 6. Submit identity form
+            id_submit = page.locator("#btnEnviar, #btnAceptar, input[type=submit][value='Enviar']").first
+            id_submit.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
+            id_submit.click()
+            page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
+            page.wait_for_timeout(2000)
+            ensure_not_rejected(page)
+
+            # 7. Intermediate "Solicitar Cita" button before results, if present
+            solicitar_btn = page.locator(
+                "#btnEntrar, input[value*='Solicitar Cita'], button:has-text('Solicitar Cita')"
+            ).first
+            if solicitar_btn.is_visible():
+                solicitar_btn.click()
+                page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
+                page.wait_for_timeout(2000)
+                ensure_not_rejected(page)
+
+            # 8. Check result
+            proof_file = ARTIFACTS / "proof.png"
+            ARTIFACTS.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(proof_file))
+            LOG.info("Proof screenshot saved to %s", proof_file)
+
+            body_text = normalized(page.locator("body").inner_text(timeout=5000))
+            if any(pattern in body_text for pattern in NO_SLOT_PATTERNS):
+                LOG.info("ICPPlus reports no appointments available")
+                return False
+
+            if any(pattern in body_text for pattern in SLOT_PATTERNS):
+                save_diagnostics(page, "slot-found")
+                LOG.warning("Appointment availability detected!")
+                return True
+
+            save_diagnostics(page, "unexpected-page")
+            raise RuntimeError("ICPPlus returned an unrecognized page; no alert was sent")
+
+        except Exception:
+            try:
+                save_diagnostics(page, "error")
+            except Exception:
+                pass
+            raise
+        finally:
+            browser.close()
+
+
+def list_procedures() -> int:
+    """Open the configured province page and print available procedure labels."""
+    stealth = Stealth(navigator_languages_override=("es-ES", "es"))
+    headless = os.getenv("HEADLESS", "true").lower() != "false"
+    proxy_config = parse_proxy_settings()
+
+    with stealth.use_sync(sync_playwright()) as p:
+        launch_kwargs = {"headless": headless}
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
+        browser = p.chromium.launch(**launch_kwargs)
+        try:
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="es-ES",
+                timezone_id="Europe/Madrid",
+            )
+            page = context.new_page()
+            stealth.apply_stealth_sync(page)
+
+            query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
+            url = f"{BASE_URL}/citar?{query}"
+            LOG.info("Loading province page: %s", url)
+            page.goto(url, timeout=45000, wait_until="load")
+            wait_for_challenge_settle(page)
+            ensure_not_rejected(page)
+
+            title = page.title().strip()
+            options = []
+            for opt in page.locator("select option").all():
+                label = " ".join(opt.inner_text().split())
+                if label and label not in options:
+                    options.append(label)
+
+            print(f"Title: {title}")
+            print(f"URL: {page.url}")
+            print(f"Procedures found ({len(options)}):")
+            for label in options:
+                print(f"- {label}")
+
+            save_diagnostics(page, "procedure-list")
+            return 0 if options else 2
+        except Exception as exc:
+            LOG.exception("Procedure inspection failed: %s", exc)
+            try:
+                save_diagnostics(page, "procedure-list-error")
+            except Exception:
+                pass
+            return 1
+        finally:
+            browser.close()
+
+
+def verify_procedure_selection() -> int:
+    """Verify ICPPlus's procedure-selection step without submitting personal data."""
+    stealth = Stealth(navigator_languages_override=("es-ES", "es"))
+    headless = os.getenv("HEADLESS", "true").lower() != "false"
+    proxy_config = parse_proxy_settings()
+
+    with stealth.use_sync(sync_playwright()) as p:
+        launch_kwargs = {"headless": headless}
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
+        browser = p.chromium.launch(**launch_kwargs)
+        try:
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                locale="es-ES",
+                timezone_id="Europe/Madrid",
+            )
+            page = context.new_page()
+            stealth.apply_stealth_sync(page)
+
+            query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
+            page.goto(f"{BASE_URL}/citar?{query}", timeout=45000, wait_until="load")
+            wait_for_challenge_settle(page)
+            ensure_not_rejected(page)
+
+            select_procedure(page)
+            print("Procedure selection verified successfully.")
+            save_diagnostics(page, "procedure-selection-verified")
+            return 0
+        except Exception as exc:
+            LOG.exception("Procedure-selection verification failed: %s", exc)
+            try:
+                save_diagnostics(page, "procedure-selection-error")
+            except Exception:
+                pass
+            return 1
+        finally:
+            browser.close()
+
+
+def test_telegram_notification() -> int:
+    """Send a live test message to verify the Telegram bot credentials and connection."""
+    validate_configuration(require_telegram=True)
+    msg = (
+        "🔔 إشعار تجريبي من بوت Cita Zarwal!\n\n"
+        f"• Trámite: {PROCEDURE_TEXT}\n"
+        f"• Provincia: {PROVINCE_CODE}\n"
+        f"• Chat ID: {CHAT_ID}\n\n"
+        "✅ البوت خدام ومربوط مزيان مع التيليغرام ديالك دابا!"
+    )
+    proof_file = ARTIFACTS / "proof.png"
+    photo_to_send = proof_file if proof_file.exists() else None
+    send_telegram(msg, photo_path=photo_to_send)
+    print("Notification sent successfully to Telegram in Moroccan Darija! Check your chat.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--list-procedures",
+        action="store_true",
+        help="inspect the configured province page without submitting personal data",
+    )
+    parser.add_argument(
+        "--verify-procedure",
+        action="store_true",
+        help="verify procedure selection without submitting personal data",
+    )
+    parser.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="send an actual live test notification to verify your Telegram setup",
+    )
+    args = parser.parse_args()
+    if args.test_telegram:
+        return test_telegram_notification()
+    if args.list_procedures:
+        return list_procedures()
+    if args.verify_procedure:
+        return verify_procedure_selection()
+    try:
+        validate_configuration()
+        has_slot = check_appointments()
+        proof_file = ARTIFACTS / "proof.png"
+        photo_proof = proof_file if proof_file.exists() else None
+
+        if has_slot:
+            url = f"{BASE_URL}/citar?{urlencode({'p': PROVINCE_CODE, 'locale': 'es'})}"
+            send_telegram(
+                "🚨 كاينا موعد متاح دابا! (Cita disponible) 🚨\n\n"
+                f"📋 Trámite: {PROCEDURE_TEXT}\n"
+                f"📍 Provincia: {PROVINCE_CODE}\n\n"
+                f"🔗 دخل ريزيرفي دغيا من هنا بيدك قبل ما يعمرو:\n{url}",
+                photo_path=photo_proof,
+            )
+            LOG.info("Telegram alert sent")
+        elif ALWAYS_NOTIFY:
+            send_telegram(
+                "ℹ️ تحديث Cita Zarwal\n\n"
+                f"مازال ما كاينين حتى مواعيد دابا لهاد الإجراء (No hay citas disponibles):\n{PROCEDURE_TEXT}\n\n"
+                "البوت مازال متبع، وغير يتفتح شي موعد غانصيفطو ليك إشعار دغيا إن شاء الله.",
+                photo_path=photo_proof,
+            )
+            LOG.info("No-availability status sent")
+        return 0
+    except Exception as exc:
+        LOG.error("Check failed (%s): %s. Availability UNKNOWN.", type(exc).__name__, exc)
+        proof_file = ARTIFACTS / "proof.png"
+        waf_file = ARTIFACTS / "waf-rejected.png"
+        photo_proof = proof_file if proof_file.exists() else (waf_file if waf_file.exists() else None)
+        if TELEGRAM_TOKEN and CHAT_ID:
+            try:
+                if is_waf_rejected_err := "request rejected" in str(exc).lower():
+                    send_telegram(
+                        "⚠️ Cita Zarwal: السيت ديال ICPPlus بلوكا الطلب (WAF - Request Rejected).\n"
+                        "هادشي كيعني بلي الـ IP تبلوكات مؤقتاً. عافاك شوف السيت بيدك ولا دير بروكسي سكني إسباني (Residential Proxy).",
+                        photo_path=photo_proof,
+                    )
+                else:
+                    send_telegram(
+                        "⚠️ Cita Zarwal: ما قدرناش نتحققو من توفر المواعيد دابا (Estado desconocido).\n"
+                        "عافاك دخل شوف السيت ديال ICPPlus بيدك باش تتأكد.",
+                        photo_path=photo_proof,
+                    )
+            except Exception:
+                LOG.error("Could not deliver the failure notification")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
