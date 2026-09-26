@@ -144,11 +144,39 @@ def save_diagnostics(page: Page, label: str) -> None:
     try:
         ARTIFACTS.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^a-z0-9_-]+", "-", label.casefold()).strip("-")
-        page.screenshot(path=str(ARTIFACTS / f"{safe}.png"))
+        try:
+            page.screenshot(path=str(ARTIFACTS / f"{safe}.png"), timeout=5000)
+        except Exception as shot_err:
+            LOG.warning("Could not capture screenshot for %s: %s", label, shot_err)
         (ARTIFACTS / f"{safe}.html").write_text(page.content(), encoding="utf-8")
         LOG.info("Saved diagnostics in %s", ARTIFACTS.resolve())
     except Exception as exc:
         LOG.warning("Failed saving diagnostics for %s: %s", label, exc)
+
+
+def setup_page_routes(context: BrowserContext) -> None:
+    """Block hanging analytics/telemetry scripts to improve reliability in CI/cloud environments."""
+    def block_unnecessary_resources(route):
+        url = route.request.url.lower()
+        if any(tracker in url for tracker in ("google-analytics.com", "ga.js", "analytics.js")):
+            route.abort()
+        else:
+            route.continue_()
+    context.route("**/*", block_unnecessary_resources)
+
+
+def navigate_page(page: Page, url: str, timeout: int = 60000, max_retries: int = 2) -> None:
+    """Navigate to URL using domcontentloaded and retry if connection stalls."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            LOG.info("Navigating to: %s (attempt %d/%d)", url, attempt, max_retries)
+            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            return
+        except Exception as exc:
+            if attempt == max_retries:
+                raise
+            LOG.warning("Navigation attempt %d failed (%s); retrying in 3s...", attempt, exc)
+            page.wait_for_timeout(3000)
 
 
 def is_waf_rejected(page: Page) -> bool:
@@ -303,13 +331,13 @@ def check_appointments() -> bool:
                 timezone_id="Europe/Madrid",
                 viewport={"width": 1920, "height": 1080},
             )
+            setup_page_routes(context)
             page: Page = context.new_page()
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
             url = f"{BASE_URL}/citar?{query}"
-            LOG.info("Navigating to: %s", url)
-            page.goto(url, timeout=45000, wait_until="load")
+            navigate_page(page, url)
 
             # 1. Wait for page/F5 challenge to settle
             wait_for_challenge_settle(page)
@@ -365,8 +393,11 @@ def check_appointments() -> bool:
             # 8. Check result
             proof_file = ARTIFACTS / "proof.png"
             ARTIFACTS.mkdir(parents=True, exist_ok=True)
-            page.screenshot(path=str(proof_file))
-            LOG.info("Proof screenshot saved to %s", proof_file)
+            try:
+                page.screenshot(path=str(proof_file), timeout=5000)
+                LOG.info("Proof screenshot saved to %s", proof_file)
+            except Exception as shot_err:
+                LOG.warning("Could not capture proof screenshot: %s", shot_err)
 
             body_text = normalized(page.locator("body").inner_text(timeout=5000))
             if any(pattern in body_text for pattern in NO_SLOT_PATTERNS):
@@ -409,13 +440,13 @@ def list_procedures() -> int:
                 locale="es-ES",
                 timezone_id="Europe/Madrid",
             )
+            setup_page_routes(context)
             page = context.new_page()
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
             url = f"{BASE_URL}/citar?{query}"
-            LOG.info("Loading province page: %s", url)
-            page.goto(url, timeout=45000, wait_until="load")
+            navigate_page(page, url)
             wait_for_challenge_settle(page)
             ensure_not_rejected(page)
 
@@ -463,11 +494,12 @@ def verify_procedure_selection() -> int:
                 locale="es-ES",
                 timezone_id="Europe/Madrid",
             )
+            setup_page_routes(context)
             page = context.new_page()
             stealth.apply_stealth_sync(page)
 
             query = urlencode({"p": PROVINCE_CODE, "locale": "es"})
-            page.goto(f"{BASE_URL}/citar?{query}", timeout=45000, wait_until="load")
+            navigate_page(page, f"{BASE_URL}/citar?{query}")
             wait_for_challenge_settle(page)
             ensure_not_rejected(page)
 
