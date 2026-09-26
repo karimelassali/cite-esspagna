@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   check-appointments:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 10
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -41,39 +41,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --requirement requirements.txt
-          playwright install --with-deps chromium
+          playwright install chromium
 
-      - name: Setup Cloudflare WARP (Bypass Cloud Datacenter Blocking)
+      - name: Runner Network Diagnostics
         run: |
-          echo "Setting up Cloudflare WARP..."
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cloudflare-warp
-          
-          # Start daemon
-          sudo systemctl start warp-svc.service || sudo service warp-svc start
-          sleep 2
-
-          # Register and switch to local SOCKS5 proxy mode
-          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
-          warp-cli --accept-tos mode proxy || warp-cli --accept-tos set-mode proxy || true
-          warp-cli --accept-tos proxy port 40000 || warp-cli --accept-tos set-proxy-port 40000 || true
-          warp-cli --accept-tos connect || true
-          sleep 3
-
-          echo "WARP status:"
-          warp-cli --accept-tos status || true
-
-          # If user did not supply a custom PROXY_SERVER secret, route through Cloudflare WARP
-          if [ -z "$PROXY_SERVER" ]; then
-            echo "Routing via Cloudflare WARP SOCKS5 proxy..."
-            echo "PROXY_SERVER=socks5://127.0.0.1:40000" >> $GITHUB_ENV
-            echo "Testing WARP SOCKS5 proxy connectivity..."
-            curl -s --max-time 10 -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace || echo "WARP trace check failed"
-          else
-            echo "Using custom configured PROXY_SERVER secret."
-          fi
+          echo "Inspecting runner network and public IP..."
+          curl -s --max-time 5 https://ipinfo.io/json || true
 
       - name: Check appointments
         run: python scraper.py
