@@ -46,7 +46,6 @@ PROCEDURE_TEXT = os.getenv(
 NIE = os.getenv("NIE", "").strip().upper()
 FULL_NAME = os.getenv("FULL_NAME", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "25"))
 ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "true").strip().casefold() in {"1", "true", "yes", "on"}
 ARTIFACTS = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
@@ -71,6 +70,27 @@ def normalized(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def get_telegram_token() -> str:
+    return os.getenv("TELEGRAM_TOKEN", "").strip() or TELEGRAM_TOKEN
+
+
+def get_chat_ids() -> list[str]:
+    raw = os.getenv("CHAT_IDS", "").strip()
+    if not raw:
+        raw = os.getenv("CHAT_ID", "").strip()
+    if not raw:
+        return []
+    tokens = re.split(r"[,;\s]+", raw)
+    seen = set()
+    result = []
+    for token in tokens:
+        item = token.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
 def validate_configuration(require_telegram: bool = True) -> None:
     missing = []
     for name, value in (
@@ -81,9 +101,11 @@ def validate_configuration(require_telegram: bool = True) -> None:
         if not value:
             missing.append(name)
     if require_telegram:
-        for name, value in (("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("CHAT_ID", CHAT_ID)):
-            if not value:
-                missing.append(name)
+        chat_ids = get_chat_ids()
+        if not get_telegram_token():
+            missing.append("TELEGRAM_TOKEN")
+        if not chat_ids:
+            missing.append("CHAT_IDS or CHAT_ID")
     if missing:
         raise ValueError("Missing required environment variables: " + ", ".join(missing))
     if not re.fullmatch(r"[XYZ]\d{7}[A-Z]", NIE):
@@ -91,41 +113,64 @@ def validate_configuration(require_telegram: bool = True) -> None:
 
 
 def send_telegram(message: str, photo_path: Path | str | None = None) -> None:
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise ValueError("TELEGRAM_TOKEN and CHAT_ID must both be set before sending a Telegram message")
+    token = get_telegram_token()
+    chat_ids = get_chat_ids()
+    if not token or not chat_ids:
+        raise ValueError("TELEGRAM_TOKEN and at least one chat ID (CHAT_IDS or CHAT_ID) must be set before sending a Telegram message")
 
-    if photo_path and Path(photo_path).exists():
-        endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        try:
-            with open(photo_path, "rb") as photo_file:
+    successful = 0
+    failed_chats = []
+
+    for chat_id in chat_ids:
+        sent = False
+        if photo_path and Path(photo_path).exists():
+            endpoint = f"https://api.telegram.org/bot{token}/sendPhoto"
+            try:
+                with open(photo_path, "rb") as photo_file:
+                    response = requests.post(
+                        endpoint,
+                        data={"chat_id": chat_id, "caption": message[:1024]},
+                        files={"photo": photo_file},
+                        timeout=30,
+                    )
+                payload = response.json() if response.ok else {}
+                if response.ok and payload.get("ok"):
+                    LOG.info("Telegram photo proof sent successfully to chat %s", chat_id)
+                    sent = True
+                else:
+                    LOG.warning("sendPhoto failed for chat %s (%s); falling back to sendMessage", chat_id, payload.get("description"))
+            except Exception as exc:
+                LOG.warning("Could not send Telegram photo to chat %s: %s", chat_id, exc)
+
+        if not sent:
+            endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+            try:
                 response = requests.post(
                     endpoint,
-                    data={"chat_id": CHAT_ID, "caption": message[:1024]},
-                    files={"photo": photo_file},
-                    timeout=30,
+                    json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+                    timeout=20,
                 )
-            payload = response.json() if response.ok else {}
-            if response.ok and payload.get("ok"):
-                LOG.info("Telegram photo proof sent successfully")
-                return
-            LOG.warning("sendPhoto failed (%s); falling back to sendMessage", payload.get("description"))
-        except Exception as exc:
-            LOG.warning("Could not send Telegram photo: %s", exc)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                if response.ok and payload.get("ok"):
+                    LOG.info("Telegram message sent successfully to chat %s", chat_id)
+                    sent = True
+                else:
+                    description = payload.get("description", f"HTTP {response.status_code}")
+                    LOG.warning("Telegram rejected message for chat %s: %s", chat_id, description)
+                    failed_chats.append((chat_id, description))
+            except Exception as exc:
+                LOG.warning("Failed to send Telegram message to chat %s: %s", chat_id, exc)
+                failed_chats.append((chat_id, str(exc)))
 
-    # Standard sendMessage fallback
-    endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    response = requests.post(
-        endpoint,
-        json={"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": True},
-        timeout=20,
-    )
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {}
-    if not response.ok or not payload.get("ok"):
-        description = payload.get("description", f"HTTP {response.status_code}")
-        raise RuntimeError(f"Telegram rejected the message: {description}")
+        if sent:
+            successful += 1
+
+    if successful == 0:
+        descriptions = [f"{cid}: {err}" for cid, err in failed_chats]
+        raise RuntimeError("Telegram message failed for all configured chats: " + "; ".join(descriptions))
 
 
 def parse_proxy_settings():
@@ -546,11 +591,13 @@ def verify_procedure_selection() -> int:
 def test_telegram_notification() -> int:
     """Send a live test message to verify the Telegram bot credentials and connection."""
     validate_configuration(require_telegram=True)
+    chat_ids = get_chat_ids()
+    chat_ids_str = ", ".join(chat_ids)
     msg = (
         "🔔 إشعار تجريبي من بوت Cita Zarwal!\n\n"
         f"• Trámite: {PROCEDURE_TEXT}\n"
         f"• Provincia: {PROVINCE_CODE}\n"
-        f"• Chat ID: {CHAT_ID}\n\n"
+        f"• Chat IDs: {chat_ids_str}\n\n"
         "✅ البوت خدام ومربوط مزيان مع التيليغرام ديالك دابا!"
     )
     proof_file = ARTIFACTS / "proof.png"
@@ -614,7 +661,7 @@ def main() -> int:
         proof_file = ARTIFACTS / "proof.png"
         waf_file = ARTIFACTS / "waf-rejected.png"
         photo_proof = proof_file if proof_file.exists() else (waf_file if waf_file.exists() else None)
-        if TELEGRAM_TOKEN and CHAT_ID:
+        if get_telegram_token() and get_chat_ids():
             try:
                 err_str = str(exc).lower()
                 if "request rejected" in err_str:
