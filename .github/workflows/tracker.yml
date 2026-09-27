@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 10
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      CHAT_IDS: ${{ secrets.CHAT_IDS }}
       CHAT_ID: ${{ secrets.CHAT_ID }}
       NIE: ${{ secrets.NIE }}
       FULL_NAME: ${{ secrets.FULL_NAME }}
