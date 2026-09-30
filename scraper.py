@@ -658,45 +658,53 @@ def main() -> int:
         return list_procedures()
     if args.verify_procedure:
         return verify_procedure_selection()
-    try:
-        validate_configuration()
-        has_slot = check_appointments()
-        proof_file = ARTIFACTS / "proof.png"
-        photo_proof = proof_file if proof_file.exists() else None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            validate_configuration()
+            has_slot = check_appointments()
+            proof_file = ARTIFACTS / "proof.png"
+            photo_proof = proof_file if proof_file.exists() else None
 
-        if has_slot:
-            url = f"{BASE_URL}/citar?{urlencode({'p': PROVINCE_CODE, 'locale': 'es'})}"
-            send_telegram(
-                "🚨 كاينا موعد متاح دابا! (Cita disponible) 🚨\n\n"
-                f"📋 Trámite: {PROCEDURE_TEXT}\n"
-                f"📍 Provincia: {PROVINCE_CODE}\n\n"
-                f"🔗 دخل ريزيرفي دغيا من هنا بيدك قبل ما يعمرو:\n{url}",
-                photo_path=photo_proof,
-            )
-            LOG.info("Telegram alert sent")
-        elif ALWAYS_NOTIFY:
-            send_telegram(
-                "ℹ️ تحديث Cita Zarwal\n\n"
-                f"مازال ما كاينين حتى مواعيد دابا لهاد الإجراء (No hay citas disponibles):\n{PROCEDURE_TEXT}\n\n"
-                "البوت مازال متبع، وغير يتفتح شي موعد غانصيفطو ليك إشعار دغيا إن شاء الله.",
-                photo_path=photo_proof,
-            )
-            LOG.info("No-availability status sent")
-        return 0
-    except Exception as exc:
-        LOG.error("Check failed (%s): %s. Availability UNKNOWN.", type(exc).__name__, exc)
-        proof_file = ARTIFACTS / "proof.png"
-        waf_file = ARTIFACTS / "waf-rejected.png"
-        photo_proof = proof_file if proof_file.exists() else (waf_file if waf_file.exists() else None)
-        if get_telegram_token() and get_chat_ids():
-            try:
-                err_str = str(exc).lower()
-                if "request rejected" in err_str:
-                    send_telegram(
-                        "⚠️ Cita Zarwal: السيت ديال ICPPlus بلوكا الطلب (WAF - Request Rejected).\n"
-                        "هادشي كيعني بلي الـ IP تبلوكات مؤقتاً. عافاك شوف السيت بيدك ولا دير بروكسي سكني إسباني (Residential Proxy).",
-                        photo_path=photo_proof,
-                    )
+            if has_slot:
+                url = f"{BASE_URL}/citar?{urlencode({'p': PROVINCE_CODE, 'locale': 'es'})}"
+                send_telegram(
+                    "🚨 كاينا موعد متاح دابا! (Cita disponible) 🚨\n\n"
+                    f"📋 Trámite: {PROCEDURE_TEXT}\n"
+                    f"📍 Provincia: {PROVINCE_CODE}\n\n"
+                    f"🔗 دخل ريزيرفي دغيا من هنا بيدك قبل ما يعمرو:\n{url}",
+                    photo_path=photo_proof,
+                )
+                LOG.info("Telegram alert sent")
+            elif ALWAYS_NOTIFY:
+                send_telegram(
+                    "ℹ️ تحديث Cita Zarwal\n\n"
+                    f"مازال ما كاينين حتى مواعيد دابا لهاد الإجراء (No hay citas disponibles):\n{PROCEDURE_TEXT}\n\n"
+                    "البوت مازال متبع، وغير يتفتح شي موعد غانصيفطو ليك إشعار دغيا إن شاء الله.",
+                    photo_path=photo_proof,
+                )
+                LOG.info("No-availability status sent")
+            return 0
+        except Exception as exc:
+            if "request rejected" in str(exc).lower() and attempt < max_attempts:
+                LOG.warning("Encountered transient WAF rate limit; waiting 15s before attempt %d...", attempt + 1)
+                time.sleep(15)
+                continue
+
+            LOG.error("Check failed (%s): %s. Availability UNKNOWN.", type(exc).__name__, exc)
+            proof_file = ARTIFACTS / "proof.png"
+            waf_file = ARTIFACTS / "waf-rejected.png"
+            photo_proof = proof_file if proof_file.exists() else (waf_file if waf_file.exists() else None)
+            if get_telegram_token() and get_chat_ids():
+                try:
+                    err_str = str(exc).lower()
+                    if "request rejected" in err_str:
+                        send_telegram(
+                            "⚠️ Cita Zarwal: جدار الحماية (F5 WAF) ديال السيت رفض الطلب مؤقتاً (Request Rejected).\n\n"
+                            "💡 هادشي كيكون بلوك مؤقت (10 إلى 15 دقيقة) حيت السيت الإسباني كيدير حماية من الضغط وكثرة الطلبات.\n"
+                            "🔄 ما تحتاج دير والو، البوت غادي يعاود المحاولة تلقائياً فـ الدورة الجاية بـ IP إسباني جديد.",
+                            photo_path=photo_proof,
+                        )
                 elif "timeout" in err_str or "timed out" in err_str:
                     if not BROWSERLESS_TOKEN and not PROXY_SERVER:
                         send_telegram(
