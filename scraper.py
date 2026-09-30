@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -67,7 +68,8 @@ SLOT_PATTERNS = (
 
 
 def normalized(value: str) -> str:
-    return " ".join(value.casefold().split())
+    s = unicodedata.normalize("NFKD", str(value)).encode("ASCII", "ignore").decode("utf-8")
+    return " ".join(re.sub(r"[^a-zA-Z0-9]+", " ", s.lower()).split())
 
 
 def get_telegram_token() -> str:
@@ -313,17 +315,21 @@ def select_procedure(page: Page) -> None:
     for sel in page.locator("select").all():
         for opt in sel.locator("option").all():
             opt_text = normalized(opt.inner_text())
-            if target in opt_text:
+            if not opt_text:
+                continue
+            if target in opt_text or opt_text in target or ("toma de huellas" in target and "toma de huellas" in opt_text):
                 val = opt.get_attribute("value")
                 sel_id = sel.get_attribute("id") or sel.get_attribute("name") or "select"
                 sel.select_option(value=val)
                 LOG.info("Selected procedure in %s: %s (value=%s)", sel_id, opt.inner_text().strip(), val)
 
-                # Reset other tramite Grupo dropdowns if needed
+                # Trigger onchange handler and reset other tramite Grupo dropdowns
                 page.evaluate(
                     """(currentId) => {
+                        const sel = document.getElementById(currentId) || document.querySelector(`select[name='${currentId}']`);
+                        if (sel && sel.onchange) sel.onchange();
                         document.querySelectorAll("select[id^='tramiteGrupo']").forEach(s => {
-                            if (s.id !== currentId) {
+                            if (s.id !== currentId && s.name !== currentId) {
                                 s.value = "-1";
                             }
                         });
@@ -331,12 +337,13 @@ def select_procedure(page: Page) -> None:
                     }""",
                     sel_id,
                 )
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(2000)
                 return
 
     # Radio button fallback
     for label in page.locator("label").all():
-        if target in normalized(label.inner_text()):
+        label_text = normalized(label.inner_text())
+        if target in label_text or label_text in target or ("toma de huellas" in target and "toma de huellas" in label_text):
             ctrl_id = label.get_attribute("for")
             if ctrl_id and page.locator(f"#{ctrl_id}").count() > 0:
                 page.locator(f"#{ctrl_id}").check()
@@ -425,7 +432,11 @@ def check_appointments() -> bool:
             wait_for_challenge_settle(page)
             dismiss_cookie_banner(page)
 
-            # 2. Select procedure
+            # 2. Wait for scripts and select procedure
+            try:
+                page.wait_for_function("() => typeof window.eliminarSeleccionOtrosGrupos === 'function'", timeout=15000)
+            except Exception:
+                pass
             select_procedure(page)
 
             # 3. Click Aceptar / Siguiente
@@ -433,44 +444,60 @@ def check_appointments() -> bool:
             submit_btn.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
             submit_btn.hover()
             page.wait_for_timeout(500)
-            submit_btn.click()
+            with page.expect_navigation(timeout=WAIT_SECONDS * 1000):
+                submit_btn.click()
 
-            # Wait for navigation / response
-            page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
             ensure_not_rejected(page)
 
-            # 4. Handle informational / entry intermediate page if present
-            # acInfo sometimes has an "Entrar" or "Acceder sin cl@ve" button
+            # 4. Handle informational / entry intermediate page if present (acInfo)
             entry_btn = page.locator(
-                "#btnEntrar, input[value*='Entrar'], button:has-text('Entrar'), a:has-text('Entrar')"
+                "#btnEntrar, input[value*='Entrar'], button:has-text('Entrar'), div:has-text('sin Cl@ve'), a:has-text('Entrar')"
             ).first
-            if entry_btn.is_visible():
-                entry_btn.click()
-                page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
-                page.wait_for_timeout(1500)
-                ensure_not_rejected(page)
+            try:
+                if entry_btn.is_visible() or page.locator("#btnEntrar").count() > 0:
+                    target_btn = page.locator("#btnEntrar").first if page.locator("#btnEntrar").count() > 0 else entry_btn
+                    target_btn.wait_for(state="visible", timeout=10000)
+                    LOG.info("Detected intermediate notice page (acInfo). Entering via 'Presentación sin Cl@ve'...")
+                    target_btn.scroll_into_view_if_needed()
+                    page.wait_for_timeout(3000)
+                    with page.expect_navigation(timeout=WAIT_SECONDS * 1000):
+                        target_btn.click()
+                    page.wait_for_timeout(3000)
+                    ensure_not_rejected(page)
+            except Exception as e:
+                LOG.warning("Intermediate notice check finished: %s", e)
 
             # 5. Fill identity data
             fill_identity(page)
 
             # 6. Submit identity form
-            id_submit = page.locator("#btnEnviar, #btnAceptar, input[type=submit][value='Enviar']").first
+            id_submit = page.locator("#btnEnviar, #btnAceptar, input[type=submit], input[value='Aceptar'], input[value='Enviar']").first
             id_submit.wait_for(state="visible", timeout=WAIT_SECONDS * 1000)
-            id_submit.click()
-            page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
-            page.wait_for_timeout(2000)
+            id_submit.hover()
+            page.wait_for_timeout(500)
+            with page.expect_navigation(timeout=WAIT_SECONDS * 1000):
+                id_submit.click()
+            page.wait_for_timeout(3000)
             ensure_not_rejected(page)
 
-            # 7. Intermediate "Solicitar Cita" button before results, if present
+            # 7. Intermediate "Solicitar Cita" button before results, if present (acValidarEntrada)
             solicitar_btn = page.locator(
-                "#btnEntrar, input[value*='Solicitar Cita'], button:has-text('Solicitar Cita')"
+                "#btnEnviar, input[value*='Solicitar Cita'], button:has-text('Solicitar Cita'), input[value='Solicitar Cita']"
             ).first
-            if solicitar_btn.is_visible():
-                solicitar_btn.click()
-                page.wait_for_load_state("networkidle", timeout=WAIT_SECONDS * 1000)
-                page.wait_for_timeout(2000)
-                ensure_not_rejected(page)
+            try:
+                if solicitar_btn.is_visible() or page.locator("input[value='Solicitar Cita']").count() > 0:
+                    target_solicitar = page.locator("input[value='Solicitar Cita']").first if page.locator("input[value='Solicitar Cita']").count() > 0 else solicitar_btn
+                    target_solicitar.wait_for(state="visible", timeout=10000)
+                    LOG.info("Detected appointment action menu (acValidarEntrada). Clicking 'Solicitar Cita'...")
+                    target_solicitar.scroll_into_view_if_needed()
+                    page.wait_for_timeout(4000)
+                    with page.expect_navigation(timeout=WAIT_SECONDS * 1000):
+                        target_solicitar.click()
+                    page.wait_for_timeout(3000)
+                    ensure_not_rejected(page)
+            except Exception as e:
+                LOG.warning("Solicitar Cita step finished: %s", e)
 
             # 8. Check result
             proof_file = ARTIFACTS / "proof.png"
