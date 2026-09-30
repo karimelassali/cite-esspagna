@@ -698,12 +698,22 @@ def main() -> int:
                         photo_path=photo_proof,
                     )
                 elif "timeout" in err_str or "timed out" in err_str:
-                    send_telegram(
-                        "⚠️ Cita Zarwal: السيت ما جاوبش فـ GitHub Actions (Timeout).\n"
-                        "سيرفرات GitHub كايكونو على برا د إسبانيا والحكومة الإسبانية كاتبلوكي اتصال السيرفرات السحابية بالكامل.\n\n"
-                        "الحل: ضيف PROXY_SERVER إسباني فـ GitHub Secrets، أو خدم السكريبت من البيسي ديالك مباشرة.",
-                        photo_path=photo_proof,
-                    )
+                    if not BROWSERLESS_TOKEN and not PROXY_SERVER:
+                        send_telegram(
+                            "⚠️ Cita Zarwal: السيت ما جاوبش (Timeout) حيت السكريبت ما لقاش BROWSERLESS_TOKEN فـ GitHub Secrets!\n\n"
+                            "الحل السريع:\n"
+                            "1. دخل لـ GitHub ديالك: Settings -> Secrets and variables -> Actions\n"
+                            "2. ضيف New repository secret سميتو بالضبط:\n"
+                            "BROWSERLESS_TOKEN\n"
+                            "وحط فيه الـ Token ديال Browserless.",
+                            photo_path=photo_proof,
+                        )
+                    else:
+                        send_telegram(
+                            "⚠️ Cita Zarwal: السيت تعطل فـ الجواب (Timeout).\n"
+                            "البوت غادي يعاود المحاولة تلقائياً فـ الدورة الجاية.",
+                            photo_path=photo_proof,
+                        )
                 else:
                     send_telegram(
                         "⚠️ Cita Zarwal: ما قدرناش نتحققو من توفر المواعيد دابا (Estado desconocido).\n"
