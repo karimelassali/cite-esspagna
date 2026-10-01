@@ -57,6 +57,12 @@ NO_SLOT_PATTERNS = (
     "no hay citas disponibles",
     "en este momento no hay citas disponibles",
     "no existen citas disponibles",
+    "no hay citas",
+    "no dispone de citas",
+    "no se dispone de citas",
+    "actualmente no hay citas",
+    "no hay citas en esta provincia",
+    "el servicio de cita previa no dispone",
 )
 SLOT_PATTERNS = (
     "seleccione una cita",
@@ -64,6 +70,9 @@ SLOT_PATTERNS = (
     "citas disponibles",
     "seleccione una fecha",
     "seleccione el horario",
+    "seleccione oficina",
+    "seleccione la oficina",
+    "citas libres",
 )
 
 
@@ -192,9 +201,9 @@ def create_browser(p, headless: bool, proxy_config: dict | None) -> Browser:
     if BROWSERLESS_TOKEN:
         ws_url = (
             f"wss://production-ams.browserless.io/chromium/stealth"
-            f"?token={BROWSERLESS_TOKEN}&proxy=residential&proxyCountry=es"
+            f"?token={BROWSERLESS_TOKEN}&proxy=residential&proxyCountry=es&timeout=300000"
         )
-        LOG.info("Connecting to Browserless (Amsterdam) with Spanish residential proxy...")
+        LOG.info("Connecting to Browserless (Amsterdam) with Spanish residential proxy (timeout=300s)...")
         return p.chromium.connect_over_cdp(ws_url)
 
     launch_kwargs = {
@@ -492,8 +501,12 @@ def check_appointments() -> bool:
                     LOG.info("Detected appointment action menu (acValidarEntrada). Clicking 'Solicitar Cita'...")
                     target_solicitar.scroll_into_view_if_needed()
                     page.wait_for_timeout(4000)
-                    with page.expect_navigation(timeout=WAIT_SECONDS * 1000):
-                        target_solicitar.click()
+                    page.wait_for_timeout(2000)
+                    try:
+                        with page.expect_navigation(timeout=15000):
+                            target_solicitar.click()
+                    except Exception:
+                        pass
                     page.wait_for_timeout(3000)
                     ensure_not_rejected(page)
             except Exception as e:
@@ -508,7 +521,19 @@ def check_appointments() -> bool:
             except Exception as shot_err:
                 LOG.warning("Could not capture proof screenshot: %s", shot_err)
 
-            body_text = normalized(page.locator("body").inner_text(timeout=5000))
+            # Wait up to 15s for either slot patterns or no-slot patterns to appear in body
+            start_check = time.time()
+            body_text = ""
+            while time.time() - start_check < 15:
+                ensure_not_rejected(page)
+                try:
+                    body_text = normalized(page.locator("body").inner_text(timeout=3000))
+                except Exception:
+                    body_text = ""
+                if any(p in body_text for p in NO_SLOT_PATTERNS) or any(p in body_text for p in SLOT_PATTERNS):
+                    break
+                page.wait_for_timeout(1000)
+
             if any(pattern in body_text for pattern in NO_SLOT_PATTERNS):
                 LOG.info("ICPPlus reports no appointments available")
                 return False
@@ -705,32 +730,32 @@ def main() -> int:
                             "🔄 ما تحتاج دير والو، البوت غادي يعاود المحاولة تلقائياً فـ الدورة الجاية بـ IP إسباني جديد.",
                             photo_path=photo_proof,
                         )
-                elif "timeout" in err_str or "timed out" in err_str:
-                    if not BROWSERLESS_TOKEN and not PROXY_SERVER:
-                        send_telegram(
-                            "⚠️ Cita Zarwal: السيت ما جاوبش (Timeout) حيت السكريبت ما لقاش BROWSERLESS_TOKEN فـ GitHub Secrets!\n\n"
-                            "الحل السريع:\n"
-                            "1. دخل لـ GitHub ديالك: Settings -> Secrets and variables -> Actions\n"
-                            "2. ضيف New repository secret سميتو بالضبط:\n"
-                            "BROWSERLESS_TOKEN\n"
-                            "وحط فيه الـ Token ديال Browserless.",
-                            photo_path=photo_proof,
-                        )
+                    elif "timeout" in err_str or "timed out" in err_str:
+                        if not BROWSERLESS_TOKEN and not PROXY_SERVER:
+                            send_telegram(
+                                "⚠️ Cita Zarwal: السيت ما جاوبش (Timeout) حيت السكريبت ما لقاش BROWSERLESS_TOKEN فـ GitHub Secrets!\n\n"
+                                "الحل السريع:\n"
+                                "1. دخل لـ GitHub ديالك: Settings -> Secrets and variables -> Actions\n"
+                                "2. ضيف New repository secret سميتو بالضبط:\n"
+                                "BROWSERLESS_TOKEN\n"
+                                "وحط فيه الـ Token ديال Browserless.",
+                                photo_path=photo_proof,
+                            )
+                        else:
+                            send_telegram(
+                                "⚠️ Cita Zarwal: السيت تعطل فـ الجواب (Timeout).\n"
+                                "البوت غادي يعاود المحاولة تلقائياً فـ الدورة الجاية.",
+                                photo_path=photo_proof,
+                            )
                     else:
                         send_telegram(
-                            "⚠️ Cita Zarwal: السيت تعطل فـ الجواب (Timeout).\n"
-                            "البوت غادي يعاود المحاولة تلقائياً فـ الدورة الجاية.",
+                            "⚠️ Cita Zarwal: ما قدرناش نتحققو من توفر المواعيد دابا (Estado desconocido).\n"
+                            "عافاك دخل شوف السيت ديال ICPPlus بيدك باش تتأكد.",
                             photo_path=photo_proof,
                         )
-                else:
-                    send_telegram(
-                        "⚠️ Cita Zarwal: ما قدرناش نتحققو من توفر المواعيد دابا (Estado desconocido).\n"
-                        "عافاك دخل شوف السيت ديال ICPPlus بيدك باش تتأكد.",
-                        photo_path=photo_proof,
-                    )
-            except Exception:
-                LOG.error("Could not deliver the failure notification")
-        return 1
+                except Exception:
+                    LOG.error("Could not deliver the failure notification")
+            return 1
 
 
 if __name__ == "__main__":
